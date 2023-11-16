@@ -6,72 +6,100 @@ from functools import partial
 from pathlib import Path
 
 import torch
+import json
+import os
 
-from llama_recipes.datasets import (
-    get_grammar_dataset,
-    get_alpaca_dataset,
-    get_samsum_dataset,
-)
+from datasets import Dataset
 
 
-def load_module_from_py_file(py_file: str) -> object:
+def read_files_to_dataset(folder, dataset_config) -> Dataset:
     """
-    This method loads a module from a py file which is not in the Python path
+    This method reads all files in the given folder
     """
-    module_name = Path(py_file).name
-    loader = importlib.machinery.SourceFileLoader(module_name, py_file)
-    spec = importlib.util.spec_from_loader(module_name, loader)
-    module = importlib.util.module_from_spec(spec)
-
-    loader.exec_module(module)
-
-    return module
-
-
-def get_custom_dataset(dataset_config, tokenizer, split: str):
-    if ":" in dataset_config.file:
-        module_path, func_name = dataset_config.file.split(":")
-    else:
-        module_path, func_name = dataset_config.file, "get_custom_dataset"
-
-    if not module_path.endswith(".py"):
-        raise ValueError(f"Dataset file {module_path} is not a .py file.")
-
-    module_path = Path(module_path)
-    if not module_path.is_file():
-        raise FileNotFoundError(f"Dataset py file {module_path.as_posix()} does not exist or is not a file.")
-
-    module = load_module_from_py_file(module_path.as_posix())
-    try:
-        return getattr(module, func_name)(dataset_config, tokenizer, split)
-    except AttributeError as e:
-        print(f"It seems like the given method name ({func_name}) is not present in the dataset .py file ({module_path.as_posix()}).")
-        raise e
-
-
-DATASET_PREPROC = {
-    "alpaca_dataset": partial(get_alpaca_dataset),
-    "grammar_dataset": get_grammar_dataset,
-    "samsum_dataset": get_samsum_dataset,
-    "custom_dataset": get_custom_dataset,
-}
-
-
-def get_preprocessed_dataset(
-    tokenizer, dataset_config, split: str = "train"
-) -> torch.utils.data.Dataset:
-    if not dataset_config.dataset in DATASET_PREPROC:
-        raise NotImplementedError(f"{dataset_config.dataset} is not (yet) implemented")
-
-    def get_split():
-        return (
-            dataset_config.train_split
-            if split == "train"
-            else dataset_config.test_split
+    # read data in folders one by one
+    # loop through all files in the folder
+    dataset_dict = {}
+    input_column = dataset_config.huggingface_file_input_column
+    target_column = dataset_config.huggingface_file_target_column
+    for filename in os.listdir(folder):
+        # check if directory or file
+        if os.path.isdir(os.path.join(folder, filename)):
+            continue
+        print(filename)
+        # get the file path
+        file_path = os.path.join(folder, filename)
+        # check json
+        data = {input_column: [], target_column: []}
+        if "json" in file_path:
+            # open the file
+            with open(file_path, encoding="utf-8") as f:
+                # read all text in the file
+                json_data = json.load(f)
+                # get the input and target
+                for i in range(0, len(json_data)):
+                    # check for unknown
+                    if "resolution for the case is unknown" in json_data[i][dataset_config.json_file_target_column]:
+                        continue
+                    data[input_column].append(json_data[i][dataset_config.json_file_input_column])
+                    data[target_column].append(json_data[i][dataset_config.json_file_target_column])
+        else:
+            dataset_single = Dataset.from_file(file_path)
+            data[input_column] = dataset_single[input_column]
+            data[target_column] = dataset_single[target_column]
+        dataset_dict[filename] = data
+    # print training data size
+    for key in dataset_dict:
+        print(key, " Data Size: ", len(dataset_dict[key][input_column]))
+    # combine to single dataset
+    dataset = {input_column: [], target_column: []}
+    for key in dataset_dict:
+        dataset[input_column] += dataset_dict[key][input_column]
+        dataset[target_column] += dataset_dict[key][target_column]
+    dataset = Dataset.from_dict(dataset)
+    # remove old tags
+    def replace_old_tags(example):
+        example[input_column] = (
+            example[input_column]
+            .replace("<|system|>", "<|system|>\n")
+            .replace("<|customer|>", "<|user|>\n")
+            .replace("<|agent|>", "<|assistant|>\n")
+            .replace("<|endoftext|>", "<|end|>\n")
         )
-
-    return DATASET_PREPROC[dataset_config.dataset](
-        dataset_config,
-        tokenizer,
-        get_split(),
+        example[target_column] = example[target_column].replace("<|endoftext|>", "<|end|>")
+        return example
+    dataset = dataset.map(
+        replace_old_tags,
+        batched=False,
+        num_proc=1,
+        load_from_cache_file=False,
     )
+    return dataset
+
+
+# custom preprocess function to calculate the loss only on the labels
+def preprocess_function_training(batch, tokenizer, dataset_config):
+    batch_size = len(batch[dataset_config.huggingface_file_input_column])
+    # create the model inputs
+    inputs = batch[dataset_config.huggingface_file_input_column]
+    targets = [str(x) for x in batch[dataset_config.huggingface_file_target_column]]
+    # tokenize the inputs and labels
+    model_inputs = tokenizer(inputs)
+    labels = tokenizer(targets)
+    # keep track of truncated inputs
+    for i in range(batch_size):
+        sample_input_ids = model_inputs["input_ids"][i]
+        # add bos_token_id to the labels - model should stop predicting after this token
+        label_input_ids = labels["input_ids"][i] + [tokenizer.eos_token_id]
+        # concatenate the labels to the end of the sample
+        model_inputs["input_ids"][i] = sample_input_ids + label_input_ids
+        # ignore everything before the label in loss calculations
+        labels["input_ids"][i] = [-100] * len(sample_input_ids) + label_input_ids
+        model_inputs["attention_mask"][i] = [1] * len(model_inputs["input_ids"][i])
+    for i in range(batch_size):
+        model_inputs["input_ids"][i] = torch.tensor(model_inputs["input_ids"][i])
+        model_inputs["attention_mask"][i] = torch.tensor(
+            model_inputs["attention_mask"][i]
+        )
+        labels["input_ids"][i] = torch.tensor(labels["input_ids"][i])
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs

@@ -2,29 +2,26 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 from dataclasses import dataclass
-
+import json
 
 @dataclass
 class train_config:
     model_name: str="PATH/to/LLAMA/7B"
+    rope_scaling: str=json.dumps({"type": "dynamic", "factor": 2.0})
     enable_fsdp: bool=False
     low_cpu_fsdp: bool=False
-    run_validation: bool=True
     batch_size_training: int=4
-    batching_strategy: str="packing" #alternative: padding
-    context_length: int=4096
     gradient_accumulation_steps: int=1
     num_epochs: int=3
     num_workers_dataloader: int=1
-    lr: float=1e-4
+    lr: float=2e-4
     weight_decay: float=0.0
     gamma: float= 0.85
-    seed: int=42
+    seed: int=27
     use_fp16: bool=False
     mixed_precision: bool=True
     val_batch_size: int=1
-    dataset = "samsum_dataset"
-    peft_method: str = "lora" # None , llama_adapter, prefix
+    peft_method: str = "lora" # None , llama_adapter, prefix, pept, v1
     use_peft: bool=False
     output_dir: str = "PATH/to/save/PEFT/model"
     freeze_layers: bool = False

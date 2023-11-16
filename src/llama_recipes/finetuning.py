@@ -7,6 +7,10 @@ from pkg_resources import packaging
 import fire
 import random
 import torch
+import datasets
+from datasets.utils.logging import disable_progress_bar
+disable_progress_bar()
+import json
 import torch.optim as optim
 from peft import get_peft_model, prepare_model_for_int8_training
 from torch.distributed.fsdp import (
@@ -14,15 +18,17 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import DataLoader
 from transformers import (
-    LlamaForCausalLM,
-    LlamaTokenizer,
-    LlamaConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
 )
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.data.data_collator import default_data_collator
 
 from llama_recipes.configs import fsdp_config as FSDP_CONFIG
 from llama_recipes.configs import train_config as TRAIN_CONFIG
+from llama_recipes.configs import dataset_config as DATASET_CONFIG
 from llama_recipes.data.concatenator import ConcatDataset
 from llama_recipes.policies import AnyPrecisionAdamW, apply_fsdp_checkpointing
 
@@ -30,11 +36,12 @@ from llama_recipes.utils import fsdp_auto_wrap_policy
 from llama_recipes.utils.config_utils import (
     update_config,
     generate_peft_config,
-    generate_dataset_config,
     get_dataloader_kwargs,
 )
-from llama_recipes.utils.dataset_utils import get_preprocessed_dataset
-
+from llama_recipes.utils.dataset_utils import (
+    read_files_to_dataset,
+    preprocess_function_training,
+)
 from llama_recipes.utils.train_utils import (
     train,
     freeze_transformer_layers,
@@ -45,11 +52,26 @@ from llama_recipes.utils.train_utils import (
     get_policies
 )
 
+def pad_to_batch_max(batch, tokenizer):
+    # get max length
+    max_length = max([len(feature["input_ids"]) for feature in batch])
+    # pad to max length
+    for i in range(len(batch)):
+        batch[i]["input_ids"] = [tokenizer.pad_token_id] * (
+            max_length - len(batch[i]["input_ids"])
+        ) + batch[i]["input_ids"]
+        batch[i]["attention_mask"] = [0] * (
+            max_length - len(batch[i]["attention_mask"])
+        ) + batch[i]["attention_mask"]
+        batch[i]["labels"] = [-100] * (
+            max_length - len(batch[i]["labels"])
+        ) + batch[i]["labels"]
+    return  default_data_collator(batch)
 
 def main(**kwargs):
     # Update the configuration for the training and sharding process
-    train_config, fsdp_config = TRAIN_CONFIG(), FSDP_CONFIG()
-    update_config((train_config, fsdp_config), **kwargs)
+    train_config, fsdp_config, dataset_config = TRAIN_CONFIG(), FSDP_CONFIG(), DATASET_CONFIG()
+    update_config((train_config, fsdp_config, dataset_config), **kwargs)
 
     # Set the seeds for reproducibility
     torch.cuda.manual_seed(train_config.seed)
@@ -70,6 +92,10 @@ def main(**kwargs):
 
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
+    additional_args = {}
+    additional_args["low_cpu_mem_usage"] = True
+    if train_config.rope_scaling:
+        additional_args["rope_scaling"] = json.loads(train_config.rope_scaling)
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
         """
         for FSDP, we can save cpu memory by loading pretrained model on rank0 only.
@@ -83,24 +109,26 @@ def main(**kwargs):
             raise Exception("latest pytorch nightly build is required to run with low_cpu_fsdp config, "
                             "please install latest nightly.")
         if rank == 0:
-            model = LlamaForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 train_config.model_name,
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
                 use_cache=use_cache,
+                **additional_args,
             )
         else:
-            llama_config = LlamaConfig.from_pretrained(train_config.model_name)
+            llama_config = AutoModelForCausalLM.from_pretrained(train_config.model_name)
             llama_config.use_cache = use_cache
             with torch.device("meta"):
-                model = LlamaForCausalLM(llama_config)
+                model = AutoModelForCausalLM(llama_config)
 
     else:
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             train_config.model_name,
             load_in_8bit=True if train_config.quantization else None,
             device_map="auto" if train_config.quantization else None,
             use_cache=use_cache,
+            **additional_args,
         )
     if train_config.enable_fsdp and train_config.use_fast_kernels:
         """
@@ -115,7 +143,7 @@ def main(**kwargs):
             print("Module 'optimum' not found. Please install 'optimum' it before proceeding.")
 
     # Load the tokenizer and add special tokens
-    tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=True)
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
@@ -127,6 +155,10 @@ def main(**kwargs):
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
     if train_config.enable_fsdp and fsdp_config.pure_bf16:
         model.to(torch.bfloat16)
+    elif train_config.enable_fsdp and fsdp_config.use_fp16:
+        model.to(torch.float16)
+
+    model.gradient_checkpointing_enable()
 
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
@@ -136,7 +168,6 @@ def main(**kwargs):
     #setting up FSDP if enable_fsdp is enabled
     if train_config.enable_fsdp:
         if not train_config.use_peft and train_config.freeze_layers:
-
             freeze_transformer_layers(train_config.num_freeze_layers)
 
         mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
@@ -159,52 +190,47 @@ def main(**kwargs):
     elif not train_config.quantization and not train_config.enable_fsdp:
         model.to("cuda")
 
-    dataset_config = generate_dataset_config(train_config, kwargs)
-
-     # Load and preprocess the dataset for training and validation
-    dataset_train = get_preprocessed_dataset(
-        tokenizer,
-        dataset_config,
-        split="train",
-    )
+    # read datasets
+    training_dataset = read_files_to_dataset(dataset_config.training_folder, dataset_config)
+    eval_dataset = None
+    if dataset_config.eval_folder:
+        eval_dataset = read_files_to_dataset(dataset_config.eval_folder, dataset_config)
+    elif dataset_config.split_training_no_eval:
+        train_eval_dataset = training_dataset.train_test_split(test_size=dataset_config.split_training_no_eval)
+        training_dataset = train_eval_dataset["train"]
+        eval_dataset = train_eval_dataset["test"]
 
     if not train_config.enable_fsdp or rank == 0:
-        print(f"--> Training Set Length = {len(dataset_train)}")
+        print(f"--> Training Set Length = {len(training_dataset)}")
 
-    dataset_val = get_preprocessed_dataset(
-        tokenizer,
-        dataset_config,
-        split="test",
+    if eval_dataset and (not train_config.enable_fsdp or rank == 0):
+        print(f"--> Validation Set Length = {len(eval_dataset)}")
+    
+    # tokenize
+    training_dataset = training_dataset.map(
+        lambda batch: preprocess_function_training(batch, tokenizer, dataset_config),
+        batched=True,
+        num_proc=1,
+        remove_columns=training_dataset.column_names,
+        load_from_cache_file=False,
     )
-    if not train_config.enable_fsdp or rank == 0:
-            print(f"--> Validation Set Length = {len(dataset_val)}")
-
-    if train_config.batching_strategy == "packing":
-        dataset_train = ConcatDataset(dataset_train, chunk_size=train_config.context_length)
-
-    train_dl_kwargs = get_dataloader_kwargs(train_config, dataset_train, tokenizer, "train")
-
-    # Create DataLoaders for the training and validation dataset
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset_train,
-        num_workers=train_config.num_workers_dataloader,
-        pin_memory=True,
-        **train_dl_kwargs,
-    )
-
-    eval_dataloader = None
-    if train_config.run_validation:
-        if train_config.batching_strategy == "packing":
-            dataset_val = ConcatDataset(dataset_val, chunk_size=train_config.context_length)
-
-        val_dl_kwargs = get_dataloader_kwargs(train_config, dataset_val, tokenizer, "val")
-
-        eval_dataloader = torch.utils.data.DataLoader(
-            dataset_val,
-            num_workers=train_config.num_workers_dataloader,
-            pin_memory=True,
-            **val_dl_kwargs,
+    if eval_dataset:
+        eval_dataset = eval_dataset.map(
+            lambda batch: preprocess_function_training(batch, tokenizer, dataset_config),
+            batched=True,
+            num_proc=1,
+            remove_columns=eval_dataset.column_names,
+            load_from_cache_file=False,
         )
+    
+    # dataloaders
+    train_dl_kwargs = get_dataloader_kwargs(train_config, training_dataset, tokenizer, "train")
+    training_dataloader = DataLoader(training_dataset, collate_fn=lambda batch: pad_to_batch_max(batch, tokenizer), pin_memory=True, **train_dl_kwargs)
+    eval_dataloder = None
+    if eval_dataset:
+        val_dl_kwargs = get_dataloader_kwargs(train_config, eval_dataset, tokenizer, "val")
+        eval_dataloder = DataLoader(eval_dataset, collate_fn=lambda batch: pad_to_batch_max(batch, tokenizer), pin_memory=True, **val_dl_kwargs)
+
 
     # Initialize the optimizer and learning rate scheduler
     if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
@@ -224,11 +250,12 @@ def main(**kwargs):
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
 
+
     # Start the training process
     results = train(
         model,
-        train_dataloader,
-        eval_dataloader,
+        training_dataloader,
+        eval_dataloder,
         tokenizer,
         optimizer,
         scheduler,
