@@ -18,7 +18,7 @@ class v1_config:
      encoder_reparameterization_type: str="LSTM"
      encoder_hidden_size: int=750
      encoder_num_layers: int=3
-     encoder_dropout: int=0.1
+     encoder_dropout: float=0.1
      num_virtual_tokens: int=20
 
 @dataclass
