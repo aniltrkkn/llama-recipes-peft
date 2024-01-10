@@ -12,7 +12,7 @@ import os
 from datasets import Dataset
 
 
-def read_files_to_dataset(folder, dataset_config) -> Dataset:
+def read_files_to_dataset(folder, dataset_config, rank) -> Dataset:
     """
     This method reads all files in the given folder
     """
@@ -47,8 +47,9 @@ def read_files_to_dataset(folder, dataset_config) -> Dataset:
             data[target_column] = dataset_single[target_column]
         dataset_dict[filename] = data
     # print training data size
-    for key in dataset_dict:
-        print(key, " Data Size: ", len(dataset_dict[key][input_column]))
+    if rank == 0:
+        for key in dataset_dict:
+            print(key, " Data Size: ", len(dataset_dict[key][input_column]))
     # combine to single dataset
     dataset = {input_column: [], target_column: []}
     for key in dataset_dict:

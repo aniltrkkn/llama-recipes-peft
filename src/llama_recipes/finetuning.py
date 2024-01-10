@@ -146,7 +146,8 @@ def main(**kwargs):
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=True)
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
+    if rank == 0:
+        print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
 
     # Prepare the model for int8 training if quantization is enabled
     if train_config.quantization:
@@ -196,10 +197,10 @@ def main(**kwargs):
         model.to("cuda")
 
     # read datasets
-    training_dataset = read_files_to_dataset(dataset_config.training_folder, dataset_config)
+    training_dataset = read_files_to_dataset(dataset_config.training_folder, dataset_config, rank)
     eval_dataset = None
     if dataset_config.eval_folder:
-        eval_dataset = read_files_to_dataset(dataset_config.eval_folder, dataset_config)
+        eval_dataset = read_files_to_dataset(dataset_config.eval_folder, dataset_config, rank)
     elif dataset_config.split_training_no_eval:
         train_eval_dataset = training_dataset.train_test_split(test_size=dataset_config.split_training_no_eval)
         training_dataset = train_eval_dataset["train"]
