@@ -12,9 +12,11 @@ class train_config:
     low_cpu_fsdp: bool=False
     batch_size_training: int=4
     gradient_accumulation_steps: int=1
+    gradient_clipping: bool = True
+    gradient_clipping_threshold: float = 1.0
     num_epochs: int=3
     num_workers_dataloader: int=1
-    lr: float=2e-4
+    lr: float=5e-4
     weight_decay: float=0.0
     gamma: float= 0.85
     seed: int=27
@@ -33,3 +35,4 @@ class train_config:
     dist_checkpoint_folder: str="fine-tuned" # will be used if using FSDP
     save_optimizer: bool=False # will be used if using FSDP
     use_fast_kernels: bool = False # Enable using SDPA from PyTroch Accelerated Transformers, make use Flash Attention and Xformer memory-efficient kernels
+    save_metrics: bool = False # saves training metrics to a json file for later plotting

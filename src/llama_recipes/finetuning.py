@@ -72,7 +72,6 @@ def main(**kwargs):
     # Update the configuration for the training and sharding process
     train_config, fsdp_config, dataset_config = TRAIN_CONFIG(), FSDP_CONFIG(), DATASET_CONFIG()
     update_config((train_config, fsdp_config, dataset_config), **kwargs)
-
     # Set the seeds for reproducibility
     torch.cuda.manual_seed(train_config.seed)
     torch.manual_seed(train_config.seed)
@@ -93,7 +92,8 @@ def main(**kwargs):
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
     additional_args = {}
-    additional_args["low_cpu_mem_usage"] = True
+   # additional_args["low_cpu_mem_usage"] = True
+   # additional_args["low_cpu_mem_usage"] = True
     if train_config.rope_scaling:
         additional_args["rope_scaling"] = json.loads(train_config.rope_scaling)
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
@@ -162,6 +162,11 @@ def main(**kwargs):
 
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
+        if rank == 0:
+            print(f"--> Training Config: {train_config}")
+            print(f"--> FSDP Config: {fsdp_config}")
+            print(f"--> Dataset Config: {dataset_config}")
+            print(f"--> PEFT Config: {peft_config}")
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
@@ -182,7 +187,7 @@ def main(**kwargs):
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
             sync_module_states=train_config.low_cpu_fsdp,
-            param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
+            param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=True)
             if train_config.low_cpu_fsdp and rank != 0 else None,
         )
         if fsdp_config.fsdp_activation_checkpointing:

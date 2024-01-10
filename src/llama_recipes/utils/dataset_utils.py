@@ -25,7 +25,6 @@ def read_files_to_dataset(folder, dataset_config) -> Dataset:
         # check if directory or file
         if os.path.isdir(os.path.join(folder, filename)):
             continue
-        print(filename)
         # get the file path
         file_path = os.path.join(folder, filename)
         # check json
