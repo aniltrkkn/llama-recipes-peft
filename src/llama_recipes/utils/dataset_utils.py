@@ -65,14 +65,46 @@ def read_files_to_dataset(folder, dataset_config, rank) -> Dataset:
             .replace("<|agent|>", "<|assistant|>\n")
             .replace("<|endoftext|>", "<|end|>\n")
         )
-        example[target_column] = example[target_column].replace("<|endoftext|>", "<|end|>")
+        if "<|endoftext|>" in example[target_column] and "<|end|>" not in example[target_column]:
+            example[target_column] = example[target_column].replace("<|endoftext|>", "<|end|>")
+        else:
+            example[target_column] = example[target_column].replace("<|endoftext|>", "")
         return example
-    dataset = dataset.map(
-        replace_old_tags,
-        batched=False,
-        num_proc=1,
-        load_from_cache_file=False,
-    )
+    # mistral version - remove old tags with empty string
+    def replace_old_tags_mistral(example):
+        example[input_column] = (
+            example[input_column]
+            .replace("<|system|>", "")
+            .replace("<|customer|>", "")
+            .replace("<|agent|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("<|end|>", "")
+            .replace("<|assistant|>", "")
+            .replace("<|user|>", "")
+        )
+        example[input_column] = f"[INST] {example[input_column]} [/INST]"
+        example[target_column] = example[target_column].replace("<|endoftext|>", "")
+        example[target_column] = example[target_column].replace("<|end|>", "")
+        return example
+
+    if dataset_config.is_mixtral or dataset_config.is_mistral_instruct:
+        dataset = dataset.map(
+            replace_old_tags_mistral,
+            batched=False,
+            num_proc=1,
+            load_from_cache_file=False,
+        )
+    else:
+        dataset = dataset.map(
+            replace_old_tags,
+            batched=False,
+            num_proc=1,
+            load_from_cache_file=False,
+        )
+    # print single data point
+    if rank == 0:
+        print("Single Data Point Training Input: ", dataset[0][input_column])
+        print("Single Data Point Training Target: ", dataset[0][target_column])
     return dataset
 
 

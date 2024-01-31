@@ -13,3 +13,5 @@ class dataset_config:
     json_file_target_column: str="targets_pretokenized"
     huggingface_file_input_column: str="input"
     huggingface_file_target_column: str="target"
+    is_mixtral: bool=False
+    is_mistral_instruct: bool=False

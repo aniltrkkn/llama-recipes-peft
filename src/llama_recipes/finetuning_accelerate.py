@@ -2,6 +2,7 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import os
+os.environ["HF_HOME"] = os.path.join("/code/", "huggingface")
 from pkg_resources import packaging
 
 import fire

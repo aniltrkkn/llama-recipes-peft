@@ -2,6 +2,8 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import os
+os.environ["TRANSFORMERS_CACHE"] = os.path.join("/code/", "huggingface")
+os.environ["HF_HOME"] = os.path.join("/code/", "huggingface")
 from pkg_resources import packaging
 
 import fire
@@ -77,6 +79,8 @@ def main(**kwargs):
     torch.manual_seed(train_config.seed)
     random.seed(train_config.seed)
 
+    local_rank = 0
+    rank = 0
     if train_config.enable_fsdp:
         setup()
         # torchrun specific
@@ -96,6 +100,9 @@ def main(**kwargs):
    # additional_args["low_cpu_mem_usage"] = True
     if train_config.rope_scaling:
         additional_args["rope_scaling"] = json.loads(train_config.rope_scaling)
+    if dataset_config.is_mixtral:
+        additional_args["use_flash_attention_2"] = True
+        additional_args["torch_dtype"] = torch.bfloat16 if fsdp_config.pure_bf16 else torch.float16 if fsdp_config.use_fp16 else torch.float32
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
         """
         for FSDP, we can save cpu memory by loading pretrained model on rank0 only.
@@ -121,12 +128,11 @@ def main(**kwargs):
             llama_config.use_cache = use_cache
             with torch.device("meta"):
                 model = AutoModelForCausalLM(llama_config)
-
     else:
         model = AutoModelForCausalLM.from_pretrained(
             train_config.model_name,
             load_in_8bit=True if train_config.quantization else None,
-            device_map="auto" if train_config.quantization else None,
+            device_map="auto" if train_config.quantization or dataset_config.is_mixtral else None,
             use_cache=use_cache,
             **additional_args,
         )
@@ -154,9 +160,9 @@ def main(**kwargs):
         model = prepare_model_for_int8_training(model)
 
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
-    if train_config.enable_fsdp and fsdp_config.pure_bf16:
+    if train_config.enable_fsdp and fsdp_config.pure_bf16 and not dataset_config.is_mixtral:
         model.to(torch.bfloat16)
-    elif train_config.enable_fsdp and fsdp_config.use_fp16:
+    elif train_config.enable_fsdp and fsdp_config.use_fp16 and not dataset_config.is_mixtral:
         model.to(torch.float16)
 
     model.gradient_checkpointing_enable()
@@ -193,7 +199,7 @@ def main(**kwargs):
         )
         if fsdp_config.fsdp_activation_checkpointing:
             apply_fsdp_checkpointing(model)
-    elif not train_config.quantization and not train_config.enable_fsdp:
+    elif not train_config.quantization and not train_config.enable_fsdp and not dataset_config.is_mixtral:
         model.to("cuda")
 
     # read datasets
